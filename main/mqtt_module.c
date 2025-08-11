@@ -30,16 +30,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
+static void
+
 
 void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.hostname = "aiot.rda.go.kr",
-        .broker.address.port = 8001,
-        .credentials.username = "C000000006+9016",
+        .broker.address.uri = "mqtts://aiot.rda.go.kr:8001",
+        .credentials.client_id = "C000000006+9016",
         .credentials.authentication.password = "63ed3bdd4c73f00f",
-        .broker.address.transport = MQTT_TRANSPORT_OVER_SSL,
         .broker.verification.certificate = (const char *)insator_server_crt_pem_start,
+        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1, 
+        .session.keepalive = 60,
+        .network.timeout_ms = 10000,
     };
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);

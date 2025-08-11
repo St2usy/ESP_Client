@@ -14,7 +14,8 @@
     "algorithm": "c",
     "queue.h": "c",
     "cstdlib": "c",
-    "random": "c"
+    "random": "c",
+    "wifi_module.h": "c"
   },
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
