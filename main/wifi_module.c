@@ -9,12 +9,58 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <string.h>
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
 
 #define WIFI_SSID "SK_WiFiGIGA10F8_2.4G"
 #define WIFI_PASS "1612000357"
 #define WIFI_CONNECTED_BIT BIT0
 static EventGroupHandle_t wifi_event_group;
 static const char *TAG = "wifi_module";
+
+// NTP 동기화 콜백(로그용)
+static void time_sync_notification_cb(struct timeval *tv) {
+    ESP_LOGI(TAG, "Time synchronized via SNTP");
+}
+
+// NTP 초기화
+static void initialize_sntp(void) {
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    // 한국 풀 서버 권장
+    sntp_setservername(0, "kr.pool.ntp.org");
+    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    sntp_init();
+}
+
+// 시간 동기화 대기 (timeout_ms 내에 년도가 2016+가 되면 OK)
+static bool wait_for_time_sync(int timeout_ms) {
+    const int poll_ms = 200;
+    int waited = 0;
+
+    // KST(+9) 타임존 설정
+    setenv("TZ", "KST-9", 1);
+    tzset();
+
+    while (waited < timeout_ms) {
+        time_t now; time(&now);
+        struct tm t; localtime_r(&now, &t);
+        if (t.tm_year + 1900 >= 2016) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(poll_ms));
+        waited += poll_ms;
+    }
+    return false;
+}
+
+// 포맷된 현재 날짜/시간 얻기
+static void get_now_strings(char out_date[11], char out_time[9]) {
+    time_t now; time(&now);
+    struct tm t; localtime_r(&now, &t);
+    strftime(out_date, 11, "%Y-%m-%d", &t);
+    strftime(out_time, 9,  "%H:%M:%S", &t);
+}
 
 static bool tcp_connect_check(const char *host, uint16_t port, int timeout_ms)
 {
@@ -126,5 +172,15 @@ void wifi_init_sta(void)
     else
     {
         ESP_LOGW(TAG, "Connectivity check FAILED: %s:%u unreachable", probe_host, probe_port);
+    }
+
+    // === NTP 동기화 ===
+    initialize_sntp();
+    if (wait_for_time_sync(15000)) { // 최대 15초 대기
+        char d[11], t[9];
+        get_now_strings(d, t);
+        ESP_LOGI(TAG, "Now (KST): %s %s", d, t);
+    } else {
+        ESP_LOGW(TAG, "Time sync timeout; check internet/NTP");
     }
 }

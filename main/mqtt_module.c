@@ -1,12 +1,34 @@
 #include "mqtt_module.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_system.h"
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include <queue.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h" // 절대 마감 구현시 사용
 
 extern const uint8_t insator_server_crt_pem_start[] asm("_binary_insator_server_crt_pem_start");
 extern const uint8_t insator_server_crt_pem_end[]   asm("_binary_insator_server_crt_pem_end");
 static const char *TAG = "mqtt_module";
 static esp_mqtt_client_handle_t mqtt_client = NULL;  // 전역 클라이언트 핸들 저장
+static TaskHandle_t s_pub_task_handle = NULL;
+static volatile bool s_mqtt_connected = false;
+#define MQTT_TEST_TOPIC "ocp/dataBus/"
+QUEUE* send_queue;
+QUEUE* receive_queue;
+static SemaphoreHandle_t sem_forConn; // binary semaphore
+int thread_all_flag = 1;
+int thread_conn_flag = 0;
+
+static bool wait_conn_with_timeout_ms(uint32_t timeout_ms)
+{
+    BaseType_t ok = xSemaphoreTake(sem_forConn, pdMS_TO_TICKS(timeout_ms));
+    return (ok == pdTRUE);  // true면 신호 수신(=응답 옴), false면 타임아웃
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -15,10 +37,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT connected");
+            // s_mqtt_connected = true;
+            // if (s_pub_task_handle == NULL) {
+            //     xTaskCreate(publisher_task, "pub_task", 4096, NULL, 5, &s_pub_task_handle);
+            // }
             break;
 
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "MQTT disconnected");
+            s_mqtt_connected = false;
+            s_pub_task_handle = NULL;
             break;
 
         case MQTT_EVENT_ERROR:
@@ -29,9 +57,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             break;
     }
 }
-
-static void
-
 
 void mqtt_app_start(void)
 {
@@ -45,6 +70,15 @@ void mqtt_app_start(void)
         .network.timeout_ms = 10000,
     };
 
+    /** QUEUE 생성 시기에 대한 메모리 최적화 필요 */
+    receive_queue = create_queue();
+    send_queue = create_queue();
+
+    /** semaphore 생성 시기에 대한 메모리 최적화 필요 */
+    sem_forConn = xSemaphoreCreateBinary();
+    configASSERT(sem_forConn != NULL);
+
+    xSemaphoreTake(sem_forConn, 0);
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     if (mqtt_client == NULL) {
         ESP_LOGE("MQTT", "Failed to create MQTT client");

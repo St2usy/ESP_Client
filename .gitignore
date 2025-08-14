@@ -2,3 +2,4 @@ build/
 sdkconfig
 sdkconfig.old
 main/insator_server.crt.pem
+test/
