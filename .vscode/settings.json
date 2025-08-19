@@ -15,7 +15,12 @@
     "queue.h": "c",
     "cstdlib": "c",
     "random": "c",
-    "wifi_module.h": "c"
+    "wifi_module.h": "c",
+    "time.h": "c",
+    "array": "c",
+    "string": "c",
+    "string_view": "c",
+    "span": "c"
   },
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
