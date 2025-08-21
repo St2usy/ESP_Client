@@ -15,6 +15,7 @@
 #include <esp_netif_sntp.h>
 #include "esp_mac.h"
 #include "cJSON.h"
+#include <stdint.h>
 
 extern const uint8_t insator_server_crt_pem_start[] asm("_binary_insator_server_crt_pem_start");
 extern const uint8_t insator_server_crt_pem_end[] asm("_binary_insator_server_crt_pem_end");
@@ -32,14 +33,15 @@ int thread_conn_flag = 0;
 static TaskHandle_t s_conn_task = NULL;
 char *auth_payload;
 cJSON *root;
+static int s_msgid_sub_auth = -1;
 
-unsigned long long OCPUtils_getCurrentTime(void)
+uint64_t OCPUtils_getCurrentTime(void)
 {
     struct timeval tv;
     gettimeofday(&tv, NULL); // NTP 동기화 후 Epoch 기반 시간 반환
-    unsigned long long millisecondsSinceEpoch =
-        (unsigned long long)tv.tv_sec * 1000ULL +
-        (unsigned long long)tv.tv_usec / 1000ULL;
+    uint64_t millisecondsSinceEpoch =
+        (uint64_t)tv.tv_sec * 1000ULL +
+        (uint64_t)tv.tv_usec / 1000ULL;
 
     return millisecondsSinceEpoch;
 }
@@ -80,94 +82,6 @@ char *OCPUtils_generateUUID(void)
     return uuid_str; // 호출자가 free() 필요
 }
 
-static bool wait_conn_with_timeout_ms(uint32_t timeout_ms)
-{
-    BaseType_t ok = xSemaphoreTake(sem_forConn, pdMS_TO_TICKS(timeout_ms));
-    return (ok == pdTRUE); // true면 신호 수신(=응답 옴), false면 타임아웃
-}
-
-void OCPManager_free_message(OCPMessage *message)
-{
-    if (message != NULL)
-    {
-        if (message->data != NULL)
-        {
-            free(message->data);
-            message->data = NULL;
-        }
-
-        free(message);
-        message = NULL;
-    }
-}
-
-void thread_keep_alive_task(void *arg)
-{
-    ESP_LOGI(TAG, "connection keep-alive task started");
-    thread_conn_flag = 0;
-
-    while (thread_all_flag)
-    {
-        // 여기에 주기적 ping/publish, reconnect 체크 등을 수행
-        // 예: 연결 확인 → 미연결이면 재연결 트리거
-        //     인가 승인 여부 체크 → 미인가면 authorize 요청 등
-
-        // 예시 로그(지우셔도 됨)
-        // ESP_LOGD(TAG, "tick.. conn_flag=%d", thread_conn_flag);
-        wait_conn_with_timeout_ms(5000);
-        vTaskDelay(pdMS_TO_TICKS(5000)); // 5초 주기
-    }
-
-    ESP_LOGI(TAG, "connection keep-alive task exiting");
-    vTaskDelete(NULL); // 자기 자신 삭제 (detach에 해당)
-}
-
-void thread_sender(void *arg)
-{
-    while (thread_all_flag)
-    {
-        if (send_queue->size > 0)
-        {
-            char *payload = (char *)(send_queue->first->message);
-            int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TEST_TOPIC,
-                                                 payload, 0 /*len=0면 strlen*/,
-                                                 1 /*QoS1*/, 0 /*retain*/);
-            if (msg_id >= 0)
-            {
-                ESP_LOGI(TAG, "Published dummy JSON to %s", MQTT_TEST_TOPIC);
-                ESP_LOGI(TAG, "%s", payload);
-                free(payload);
-                delete_queue(send_queue);
-            }
-            else
-            {
-                ESP_LOGW(TAG, "Publish failed (ret=%d)", msg_id);
-                free(payload);
-                delete_queue(send_queue);
-            }
-        }
-        else
-        {
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-void thread_receiver(void *arg)
-{
-    while (thread_all_flag)
-    {
-        if (receive_queue->size > 0)
-        {
-            char *message = (char *)(receive_queue->first->message);
-            if (message)
-            {
-                /* 수신 이후 처리 */
-            }
-        }
-    }
-}
-
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t *event = (esp_mqtt_event_handle_t)event_data;
@@ -177,18 +91,41 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
     {
         ESP_LOGI(TAG, "MQTT connected");
+        s_mqtt_connected = true;
 
+        // 1) 인증 응답/결과를 받을 토픽을 먼저 구독
+        s_msgid_sub_auth = esp_mqtt_client_subscribe(mqtt_client,
+                                                     "ocp/C000000006/9016",
+                                                     1);
+        if (s_msgid_sub_auth < 0)
+        {
+            ESP_LOGE(TAG, "subscribe failed: %d", s_msgid_sub_auth);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "subscribe sent, submsg_id=%d", s_msgid_sub_auth);
+        }
+        const char *hello = "{\"authcode\":\"63ed3bdd4c73f00f\"}";
+        esp_mqtt_client_publish(mqtt_client, "ocp/C000000006/9016", hello, 0, 1, 0);
+        break; // ★ 반드시 필요
+    }
+
+    case MQTT_EVENT_DISCONNECTED:
+    {
+        ESP_LOGI(TAG, "MQTT disconnected");
+        s_mqtt_connected = false;
+        s_pub_task_handle = NULL;
+        break;
+    }
+
+    case MQTT_EVENT_SUBSCRIBED:
+    {
         if (!auth_payload)
         {
             ESP_LOGE(TAG, "auth_payload is NULL (build it before connecting)");
             break;
         }
-
-        // 길이 명시 권장
         size_t plen = strlen(auth_payload);
-
-        // 1) 복사 전송: outbox에 payload를 복사 -> 즉시 free해도 안전
-        //    (QoS1/retain은 필요에 맞춰 조정)
         int msg_id = esp_mqtt_client_enqueue(
             mqtt_client,
             MQTT_TEST_TOPIC,
@@ -199,31 +136,26 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             true /*copy*/
         );
         ESP_LOGI(TAG, "enqueued auth msg, id=%d, len=%u", msg_id, (unsigned)plen);
-
-        // 2) 여기서 바로 정리해도 안전 (copy=true 덕분)
         cJSON_free(auth_payload);
         auth_payload = NULL;
         cJSON_Delete(root);
         root = NULL;
-
-        // ❌ vTaskDelay(pdMS_TO_TICKS(5000));  // 핸들러에서 금지
         break;
     }
 
-    case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "MQTT disconnected");
-        s_mqtt_connected = false;
-        s_pub_task_handle = NULL;
-        break;
-
     case MQTT_EVENT_ERROR:
+    {
         ESP_LOGE(TAG, "MQTT error");
         break;
+    }
 
     case MQTT_EVENT_DATA:
+    {
         ESP_LOGI(TAG, "MQTT data received");
         add_queue(receive_queue, event);
         break;
+    }
+
     default:
         break;
     }
@@ -235,40 +167,35 @@ void mqtt_app_start(void)
         .broker.address.uri = "mqtts://aiot.rda.go.kr:8001",
         .credentials.client_id = "C000000006+9016",
         .credentials.authentication.password = "63ed3bdd4c73f00f",
+        .credentials.username = "C000000006+9016",
+
         .broker.verification.certificate = (const char *)insator_server_crt_pem_start,
-        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
         .session.keepalive = 60,
         .network.timeout_ms = 10000,
+        .session = {
+            .keepalive = 60,          // 초. 기본 120 근방. 브로커 정책에 맞추기
+            .disable_clean_session = false, // true면 Persistent Session
+            .last_will = {
+                .topic = "ocp/C000000006/9016",
+                .msg = "{\"authcode\":\"63ed3bdd4c73f00f\"}",
+                .msg_len = 0,  // 0이면 strlen(msg) 사용
+                .qos = 1,
+                .retain = 1,
+            },
+        },
     };
 
-    /** QUEUE 생성 시기에 대한 메모리 최적화 필요 */
     receive_queue = create_queue();
     send_queue = create_queue();
 
-    /** semaphore 생성 시기에 대한 메모리 최적화 필요 */
     sem_forConn = xSemaphoreCreateBinary();
     configASSERT(sem_forConn != NULL);
     xSemaphoreTake(sem_forConn, 0);
 
-    /** thread 생성 */
-    if (xTaskCreate(thread_keep_alive_task, "conn_task", 4096, NULL, 5, &s_pub_task_handle) == pdPASS)
-    {
-        printf("Task created successfully!\n");
-    }
-
-    if (xTaskCreate(thread_sender, "send_task", 4096, NULL, 5, &s_pub_task_handle) == pdPASS)
-    {
-        printf("Task created successfully!\n");
-    }
-
-    // if(xTaskCreate(thread_receiver, "recv_task", 4096, NULL, 5, &s_pub_task_handle)==pdPASS) {
-    //     printf("Task created successfully!\n");
-    //     }
-
     // *** 인증 메시지 생성 *** //
     char *auth_data = "{\"authcode\":\"63ed3bdd4c73f00f\"}";
     char *msgId = OCPUtils_generateUUID();
-    unsigned long long msgDate = OCPUtils_getCurrentTime();
+    uint64_t msgDate = OCPUtils_getCurrentTime();
 
     root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "version", "2.9.0");
@@ -286,6 +213,7 @@ void mqtt_app_start(void)
     cJSON_AddStringToObject(root, "severity", "0");
     cJSON_AddStringToObject(root, "encType", "0");
     cJSON_AddStringToObject(root, "authToken", "");
+
     // data가 JSON이면 파싱해서 붙이기, 아니면 문자열로
     cJSON *data_obj = cJSON_Parse(auth_data);
     if (data_obj)
@@ -298,7 +226,6 @@ void mqtt_app_start(void)
     }
     cJSON_AddNumberToObject(root, "datlen", (double)strlen(auth_data));
     auth_payload = cJSON_PrintUnformatted(root); // 동적할당
-
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     if (mqtt_client == NULL)
     {
